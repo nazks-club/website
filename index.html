@@ -539,7 +539,7 @@ function UserChip() {
 }
 
 // Google Apps Script Web App URL (শেষে /exec দিয়ে). বসালে লগইন Google Sheet থেকে যাচাই হবে
-const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwNh1sweRZ-WOfrM1hKFHehe0QIWyuintDg2K9BEhSLek_b6LSDxJ1Y1qOQV-dUqCPfSg/exec';
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwOyb4xHJMHZpYlrwL4gQVwqKHkOdr-7ZZGcUDAgOxY-kvn-oUAghgBK1pHnxIoj1HhtA/exec';
 
 // ---------- Live content sync + image upload (auto-save to server) ----------
 const CONTENT_CACHE_KEY = 'nag_content_cache_v1';
@@ -599,6 +599,13 @@ function ImagePicker({ onPick, showToast, label = 'ডিভাইস থেক�
       </button>
     </div>
   );
+}
+
+// Sheet row -> dashboard application
+function fmtApp(a) {
+  let d = '';
+  try { d = a.submittedAt ? new Date(a.submittedAt).toLocaleDateString('bn-BD', { day: 'numeric', month: 'long', year: 'numeric' }) : ''; } catch (e) {}
+  return { id: a.id, fullName: a.fullName, phone: a.phone, email: a.email, address: a.address, profession: a.profession, interest: a.interest, bio: a.bio, status: a.status || 'pending', appliedAt: d };
 }
 
 function App() {
@@ -669,6 +676,33 @@ function App() {
     return () => clearTimeout(t);
   }, [orgSettings, activities, gallery, notices, members, contentReady, isAdminAuthenticated]);
 
+  // ---- স্বেচ্ছাসেবক আবেদন: Google Sheet থেকে লোড + নতুন আবেদনের নোটিফিকেশন ----
+  const knownAppIds = useRef(null);
+  useEffect(() => {
+    if (!isAdminAuthenticated || !window.__adminAuth) return;
+    let stop = false;
+    const load = async () => {
+      try {
+        const r = await apiPost({ action: 'app_list', email: window.__adminAuth.email, password: window.__adminAuth.password });
+        if (stop || !r || !r.ok || !Array.isArray(r.applications)) return;
+        const list = r.applications.map(fmtApp);
+        if (knownAppIds.current) {
+          const fresh = list.filter((a) => !knownAppIds.current.has(a.id));
+          if (fresh.length) {
+            const msg = fresh.length === 1 ? 'নতুন আবেদন এসেছে: ' + fresh[0].fullName : fresh.length + 'টি নতুন স্বেচ্ছাসেবক আবেদন এসেছে';
+            showToast('🔔 ' + msg);
+            try { if ('Notification' in window && Notification.permission === 'granted') new Notification('নতুন স্বেচ্ছাসেবক আবেদন', { body: msg }); } catch (e) {}
+          }
+        }
+        knownAppIds.current = new Set(list.map((a) => a.id));
+        setApplications(list);
+      } catch (e) {}
+    };
+    load();
+    const t = setInterval(load, 30000);
+    return () => { stop = true; clearInterval(t); knownAppIds.current = null; };
+  }, [isAdminAuthenticated]);
+
   // Toast Notification State (No browser alerts!)
   const [user, setUser] = useState(() => { try { return JSON.parse(localStorage.getItem('nag_user') || 'null'); } catch (e) { return null; } });
   const loginUser = (u) => { try { localStorage.setItem('nag_user', JSON.stringify(u)); } catch (e) {} setUser(u); };
@@ -707,6 +741,7 @@ function App() {
         if (data.ok) {
           window.__adminAuth = { email: adminCredentials.email.trim(), password: adminCredentials.password };
           setIsAdminAuthenticated(true);
+          try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission(); } catch (e) {}
           setShowAdminLoginModal(false);
           setViewMode('admin');
           setLoginError('');
@@ -812,15 +847,19 @@ function App() {
           gallery={gallery}
           notices={notices.filter((n) => n.published)}
           members={members}
-          onSubmitApplication={(appData) => {
-            const newApp = {
-              ...appData,
-              id: `APP-${Date.now().toString().slice(-4)}`,
-              status: 'pending',
-              appliedAt: 'আজ'
-            };
-            setApplications([newApp, ...applications]);
+          onSubmitApplication={async (appData) => {
+            let id = `APP-${Date.now().toString().slice(-6)}`;
+            try {
+              const r = await apiPost({ action: 'app_submit', ...appData });
+              if (!r || !r.ok) { showToast((r && r.message) || 'আবেদন জমা হয়নি। আবার চেষ্টা করুন।', 'error'); return false; }
+              if (r.id) id = r.id;
+            } catch (e) {
+              showToast('সার্ভারের সাথে সংযোগ করা যায়নি। ইন্টারনেট দেখে আবার চেষ্টা করুন।', 'error');
+              return false;
+            }
+            setApplications((prev) => [{ ...appData, id, status: 'pending', appliedAt: 'আজ' }, ...prev]);
             showToast('আপনার স্বেচ্ছাসেবক আবেদন সফলভাবে জমা হয়েছে!');
+            return true;
           }}
           onSubmitContact={(msgData) => {
             setContactMessages([{ ...msgData, id: Date.now(), date: 'আজ' }, ...contactMessages]);
@@ -896,8 +935,10 @@ function PublicWebsite({
     address: '',
     profession: '',
     interest: 'স্বেচ্ছায় রক্তদান',
-    bio: ''
+    bio: '',
+    website: ''
   });
+  const [volunteerBusy, setVolunteerBusy] = useState(false);
   const [volunteerSubmitted, setVolunteerSubmitted] = useState(false);
 
   // Contact Form State
@@ -952,9 +993,13 @@ function PublicWebsite({
   const filteredGallery =
     galleryFilter === 'সব' ? gallery : gallery.filter((item) => item.category === galleryFilter);
 
-  const handleVolunteerSubmit = (e) => {
+  const handleVolunteerSubmit = async (e) => {
     e.preventDefault();
-    onSubmitApplication(volunteerForm);
+    if (volunteerBusy) return;
+    setVolunteerBusy(true);
+    const ok = await onSubmitApplication(volunteerForm);
+    setVolunteerBusy(false);
+    if (!ok) return;
     setVolunteerSubmitted(true);
     setVolunteerForm({
       fullName: '',
@@ -963,7 +1008,8 @@ function PublicWebsite({
       address: '',
       profession: '',
       interest: 'স্বেচ্ছায় রক্তদান',
-      bio: ''
+      bio: '',
+      website: ''
     });
     setTimeout(() => setVolunteerSubmitted(false), 6000);
   };
@@ -1824,12 +1870,15 @@ function PublicWebsite({
                       />
                     </div>
 
+                    <input type="text" tabIndex={-1} autoComplete="off" aria-hidden="true" value={volunteerForm.website} onChange={(e) => setVolunteerForm({ ...volunteerForm, website: e.target.value })} style={{ position: 'absolute', left: '-9999px', opacity: 0, height: 0, width: 0 }} />
+
                     <button
                       type="submit"
+                      disabled={volunteerBusy}
                       className="w-full py-4 rounded-xl bg-[#087F5B] hover:bg-[#06694b] text-white font-semibold text-base transition-all shadow-lg shadow-[#087F5B]/20 flex items-center justify-center gap-2"
                     >
                       <UserPlus size={19} strokeWidth={2} />
-                      <span>সদস্যপদের আবেদন জমা দিন</span>
+                      <span>{volunteerBusy ? 'জমা হচ্ছে...' : 'সদস্যপদের আবেদন জমা দিন'}</span>
                     </button>
                   </form>
                 )}
@@ -2229,6 +2278,11 @@ function AdminDashboard({
 
   // ---- Volunteer Application Approval ----
   const handleApplicationStatus = (app, status) => {
+    if (window.__adminAuth) {
+      apiPost({ action: 'app_update', email: window.__adminAuth.email, password: window.__adminAuth.password, id: app.id, status })
+        .then((r) => { if (!r || !r.ok) showToast('Google Sheet-এ স্ট্যাটাস সেভ হয়নি', 'error'); })
+        .catch(() => showToast('Google Sheet-এ স্ট্যাটাস সেভ হয়নি', 'error'));
+    }
     setApplications(applications.map((a) => (a.id === app.id ? { ...a, status } : a)));
     if (status === 'approved') {
       const newMem = {
